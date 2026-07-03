@@ -4,6 +4,8 @@ import time
 import threading
 import asyncio
 import logging
+import math
+import random
 from collections import deque
 import tkinter as tk
 from tkinter import messagebox
@@ -20,6 +22,7 @@ import matplotlib.gridspec as gridspec
 from ble_scanner import BLEProximityScanner
 from wifi_monitor import WiFiMonitor
 from detector import DetectionEngine
+from distance_estimator import calculate_distance
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +30,108 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Set customtkinter appearance
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+class RadarMap(ctk.CTkFrame):
+    def __init__(self, master, app_state, **kwargs):
+        super().__init__(master, **kwargs)
+        self.app = app_state
+        
+        self.canvas = tk.Canvas(self, bg="#1a1a1a", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.sweep_angle = 0.0
+        self.canvas.bind("<Configure>", lambda e: self.redraw())
+        
+    def redraw(self):
+        if not self.winfo_exists():
+            return
+            
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        
+        if w <= 1 or h <= 1:
+            return
+            
+        self.canvas.delete("all")
+        
+        cx = w / 2
+        cy = h / 2
+        r_max = min(w, h) / 2 - 25
+        if r_max < 10:
+            return
+            
+        scale = r_max / 15.0
+        
+        # Concentric rings
+        ring_color = "#1f4a3e"
+        for distance in [1, 3, 5, 10, 15]:
+            r = distance * scale
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=ring_color, width=1)
+            self.canvas.create_text(cx + r, cy - 8, text=f"{distance}m", fill="#668877", font=("Helvetica", 8))
+            
+        # Crosshairs
+        self.canvas.create_line(cx - r_max, cy, cx + r_max, cy, fill=ring_color, width=1)
+        self.canvas.create_line(cx, cy - r_max, cx, cy + r_max, fill=ring_color, width=1)
+        
+        # Draw radar sweep trail (semi-transparent fading green wedge)
+        trail_steps = 20
+        for i in range(trail_steps):
+            angle = self.sweep_angle - (i * 0.04)
+            alpha_ratio = 1.0 - (i / trail_steps)
+            green_val = int(180 * alpha_ratio)
+            color = f"#00{green_val:02x}20"
+            
+            tx = cx + r_max * math.cos(angle)
+            ty = cy - r_max * math.sin(angle)
+            self.canvas.create_line(cx, cy, tx, ty, fill=color, width=2)
+            
+        # Draw sweep line itself
+        sx = cx + r_max * math.cos(self.sweep_angle)
+        sy = cy - r_max * math.sin(self.sweep_angle)
+        self.canvas.create_line(cx, cy, sx, sy, fill="#00ff66", width=2)
+        
+        # Laptop at center
+        self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#00ffcc", outline="")
+        self.canvas.create_text(cx, cy + 15, text="LAPTOP (0,0,0)", fill="#00ffcc", font=("Helvetica", 9, "bold"))
+        
+        # Plot BLE devices
+        devices = self.app.ble_scanner.get_devices()
+        
+        for mac, dev in devices.items():
+            rssi = dev.get('kalman_rssi', dev['ema_rssi'])
+            distance = calculate_distance(rssi, self.app.ref_rssi_a, self.app.path_loss_n)
+            
+            if 'angle' not in dev:
+                dev['angle'] = random.uniform(0, 2 * math.pi)
+                
+            # Slowly drift angle
+            dev['angle'] = (dev['angle'] + 0.003) % (2 * math.pi)
+            
+            r_pixels = min(distance * scale, r_max)
+            bx = cx + r_pixels * math.cos(dev['angle'])
+            by = cy - r_pixels * math.sin(dev['angle'])
+            
+            diff = (self.sweep_angle - dev['angle']) % (2 * math.pi)
+            
+            if diff < 1.2:
+                intensity = 1.0 - (diff / 1.2) * 0.7
+            else:
+                intensity = 0.3
+                
+            glow_intensity = int(255 * intensity)
+            color = f"#00{glow_intensity:02x}{glow_intensity:02x}"
+            
+            blip_size = 6 if intensity > 0.6 else 4
+            self.canvas.create_oval(bx - blip_size, by - blip_size, bx + blip_size, by + blip_size, fill=color, outline="")
+            
+            if intensity > 0.7:
+                glow_r = blip_size + 4
+                self.canvas.create_oval(bx - glow_r, by - glow_r, bx + glow_r, by + glow_r, outline=color, width=1)
+                
+            name = dev['name']
+            label_text = f"{name[:12]} ({distance:.1f}m)"
+            self.canvas.create_text(bx, by - 12, text=label_text, fill=color, font=("Helvetica", 8, "bold" if intensity > 0.6 else "normal"))
+
 
 class DetectorApp(ctk.CTk):
     def __init__(self):
@@ -40,6 +145,8 @@ class DetectorApp(ctk.CTk):
         self.is_running = True
         self.wifi_enabled = True
         self.ble_enabled = True
+        self.ref_rssi_a = -59.0
+        self.path_loss_n = 2.5
         
         # Instances
         self.wifi_monitor = WiFiMonitor(scan_interval=1.5)
@@ -71,6 +178,9 @@ class DetectorApp(ctk.CTk):
         # Start local UI update loop (100ms)
         self.update_ui()
         
+        # Start radar sweep animation loop (33ms)
+        self.update_radar()
+        
         # Handle close window
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -89,7 +199,7 @@ class DetectorApp(ctk.CTk):
         # ==========================================
         self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
-        self.sidebar.grid_rowconfigure(8, weight=1) # Spacer row
+        self.sidebar.grid_rowconfigure(12, weight=1) # Spacer row
         
         # Logo / Title
         self.logo_label = ctk.CTkLabel(self.sidebar, text="SENSORS CONTROL", font=ctk.CTkFont(size=20, weight="bold"))
@@ -124,9 +234,25 @@ class DetectorApp(ctk.CTk):
         self.ble_thresh_slider.set(-75)
         self.ble_thresh_slider.grid(row=7, column=0, padx=20, pady=(0, 15), sticky="ew")
         
+        # Ref RSSI Slider (A)
+        self.ref_rssi_label = ctk.CTkLabel(self.sidebar, text="Ref RSSI at 1m (A): -59.0 dBm", font=ctk.CTkFont(size=12))
+        self.ref_rssi_label.grid(row=8, column=0, padx=20, pady=(10, 0), sticky="w")
+        
+        self.ref_rssi_slider = ctk.CTkSlider(self.sidebar, from_=-80, to=-40, number_of_steps=40, command=self.on_ref_rssi_change)
+        self.ref_rssi_slider.set(-59.0)
+        self.ref_rssi_slider.grid(row=9, column=0, padx=20, pady=(0, 15), sticky="ew")
+        
+        # Path Loss Exponent Slider (n)
+        self.path_loss_label = ctk.CTkLabel(self.sidebar, text="Path Loss Exponent (n): 2.50", font=ctk.CTkFont(size=12))
+        self.path_loss_label.grid(row=10, column=0, padx=20, pady=(10, 0), sticky="w")
+        
+        self.path_loss_slider = ctk.CTkSlider(self.sidebar, from_=1.0, to=5.0, number_of_steps=40, command=self.on_path_loss_change)
+        self.path_loss_slider.set(2.5)
+        self.path_loss_slider.grid(row=11, column=0, padx=20, pady=(0, 15), sticky="ew")
+        
         # BLE Device List Section
         self.devices_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.devices_frame.grid(row=9, column=0, padx=10, pady=10, sticky="nsew")
+        self.devices_frame.grid(row=13, column=0, padx=10, pady=10, sticky="nsew")
         self.devices_frame.grid_columnconfigure(0, weight=1)
         self.devices_frame.grid_rowconfigure(1, weight=1)
         
@@ -143,12 +269,13 @@ class DetectorApp(ctk.CTk):
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
         self.main_content.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
         self.main_content.grid_columnconfigure(0, weight=1)
+        self.main_content.grid_columnconfigure(1, weight=1)
         self.main_content.grid_rowconfigure(0, weight=0) # Status Indicator Card
-        self.main_content.grid_rowconfigure(1, weight=1) # Plots
+        self.main_content.grid_rowconfigure(1, weight=1) # Plots & Radar Map
         
         # Header / Status Card
         self.status_card = ctk.CTkFrame(self.main_content, height=120)
-        self.status_card.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        self.status_card.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
         self.status_card.grid_columnconfigure(0, weight=1)
         
         # Big Glow / Status Label
@@ -171,6 +298,10 @@ class DetectorApp(ctk.CTk):
         # Map/Plot canvas frame
         self.plot_frame = ctk.CTkFrame(self.main_content)
         self.plot_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        
+        # Radar Map frame
+        self.radar_map = RadarMap(self.main_content, self)
+        self.radar_map.grid(row=1, column=1, sticky="nsew", padx=10, pady=10)
         
         # Initialize Matplotlib Figure
         self._init_matplotlib()
@@ -282,6 +413,14 @@ class DetectorApp(ctk.CTk):
         self.detector.ble_rssi_threshold = val_int
         self.ble_scanner.proximity_threshold = val_int
         self.ble_thresh_label.configure(text=f"BLE Proximity Threshold: {val_int} dBm")
+        
+    def on_ref_rssi_change(self, val):
+        self.ref_rssi_a = float(val)
+        self.ref_rssi_label.configure(text=f"Ref RSSI at 1m (A): {float(val):.1f} dBm")
+        
+    def on_path_loss_change(self, val):
+        self.path_loss_n = float(val)
+        self.path_loss_label.configure(text=f"Path Loss Exponent (n): {float(val):.2f}")
         
     def redraw_charts(self):
         if not self.time_history:
@@ -406,6 +545,20 @@ class DetectorApp(ctk.CTk):
             
         # Reschedule UI update (100ms)
         self.after(100, self.update_ui)
+        
+    def update_radar(self):
+        """Animation loop for the radar widget."""
+        if not self.is_running:
+            return
+            
+        try:
+            if hasattr(self, 'radar_map'):
+                self.radar_map.sweep_angle = (self.radar_map.sweep_angle + 0.04) % (2 * math.pi)
+                self.radar_map.redraw()
+        except Exception as e:
+            logging.error(f"Error updating radar animation: {e}")
+            
+        self.after(33, self.update_radar) # Target 30 FPS
         
     def on_closing(self):
         """Clean shutdown of background tasks and threads."""

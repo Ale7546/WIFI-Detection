@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import time
+import random
+import math
 from typing import Dict, Tuple, Optional
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from distance_estimator import KalmanFilter1D
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,11 +30,16 @@ class BLEProximityScanner:
         now = time.time()
         
         if mac not in self.devices:
+            kf = KalmanFilter1D(process_variance=0.05, measurement_variance=4.0)
+            kf.update(rssi)
             self.devices[mac] = {
                 'name': name,
                 'rssi_history': [rssi],
                 'ema_rssi': float(rssi),
-                'last_seen': now
+                'kalman_rssi': float(rssi),
+                'kalman': kf,
+                'last_seen': now,
+                'angle': random.uniform(0, 2 * math.pi)
             }
         else:
             dev = self.devices[mac]
@@ -43,6 +51,11 @@ class BLEProximityScanner:
             
             # Update EMA: EMA_new = alpha * RSSI_new + (1 - alpha) * EMA_old
             dev['ema_rssi'] = self.ema_alpha * rssi + (1 - self.ema_alpha) * dev['ema_rssi']
+            if 'kalman' not in dev:
+                dev['kalman'] = KalmanFilter1D(process_variance=0.05, measurement_variance=4.0)
+            dev['kalman_rssi'] = dev['kalman'].update(rssi)
+            if 'angle' not in dev:
+                dev['angle'] = random.uniform(0, 2 * math.pi)
             dev['last_seen'] = now
 
     async def start(self):
@@ -100,7 +113,7 @@ class BLEProximityScanner:
         }
 
     def get_max_rssi(self) -> Tuple[Optional[str], float]:
-        """Returns the MAC address and highest EMA RSSI among all active devices."""
+        """Returns the MAC address and highest Kalman or EMA RSSI among all active devices."""
         active_devices = self.get_devices()
         if not active_devices:
             return None, -100.0
@@ -108,8 +121,9 @@ class BLEProximityScanner:
         best_mac = None
         best_rssi = -100.0
         for mac, dev in active_devices.items():
-            if dev['ema_rssi'] > best_rssi:
-                best_rssi = dev['ema_rssi']
+            val = dev.get('kalman_rssi', dev['ema_rssi'])
+            if val > best_rssi:
+                best_rssi = val
                 best_mac = mac
         return best_mac, best_rssi
 
